@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AccessibleAction, AnyElement, App, DefiniteLength, Edges, ElementId, Entity, Hsla,
+    AccessibleAction, AnyElement, App, DefiniteLength, Edges, ElementId, Entity, FocusHandle, Hsla,
     InteractiveElement as _, IntoElement, ParentElement as _, Rems, RenderOnce, Role, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled, TextAlign, TouchPhase, Window, div,
     px, relative,
@@ -84,6 +84,37 @@ fn accessibility_role(
             ) => Role::TextInput,
         }
     })
+}
+
+/// The accessible frame's own focus handle, plus the subscription that hands
+/// focus landing directly on the frame to the editor.
+///
+/// The frame carries the accessibility role, label, value and SetValue, so an
+/// assistive Focus request resolves to the frame's handle (gpui's built-in
+/// Focus action focuses the handle registered for the node). The editor, a
+/// roleless child, owns key context, Enter and text input. Without the hand-off
+/// Return and typed text dispatch from the frame and never reach the editor
+/// (DESKTOP-QA-20260923 bug 4). A mouse-down on the frame's own padding focuses
+/// the frame the same way. Focus inside the frame (the editor, prefix/suffix
+/// controls) is not "directly on the frame" and is left alone.
+struct InputFrameFocus {
+    handle: FocusHandle,
+    _forward_to_editor: gpui::Subscription,
+}
+
+impl InputFrameFocus {
+    fn new(editor: TextInputState, window: &mut Window, cx: &mut gpui::Context<Self>) -> Self {
+        let handle = cx.focus_handle();
+        let forward_to_editor = cx.on_focus(&handle, window, move |_, window, cx| {
+            if !editor.presentation(cx).is_disabled() {
+                editor.focus(window, cx);
+            }
+        });
+        Self {
+            handle,
+            _forward_to_editor: forward_to_editor,
+        }
+    }
 }
 
 fn exposes_accessibility_value(masked: bool, content_type: Option<InputContentType>) -> bool {
@@ -677,11 +708,19 @@ impl RenderOnce for Input {
             sync_native_content_type(window, content_type, presentation.is_editable());
         }
         let frame_focus_handle = window
-            .use_keyed_state(("input-frame-focus", state.entity_id()), cx, |_, cx| {
-                cx.focus_handle()
+            .use_keyed_state(("input-frame-focus", state.entity_id()), cx, {
+                let editor = state.clone();
+                move |window, cx| InputFrameFocus::new(editor, window, cx)
             })
             .read(cx)
+            .handle
             .clone();
+        #[cfg(test)]
+        tests::FRAME_FOCUS.with(|frames| {
+            frames
+                .borrow_mut()
+                .insert(state.entity_id(), frame_focus_handle.clone())
+        });
         let focused = input_focused
             || (frame_focus_handle.contains_focused(window, cx) && !presentation.is_disabled());
 
@@ -1190,6 +1229,209 @@ mod tests {
             *captured.lock().unwrap(),
             vec![None, Some("search.query".into())]
         );
+    }
+
+    thread_local! {
+        /// Each rendered Input's frame focus handle, by editor entity, so tests
+        /// can focus the frame exactly as gpui's built-in AX Focus action does.
+        pub(super) static FRAME_FOCUS: std::cell::RefCell<
+            std::collections::HashMap<gpui::EntityId, gpui::FocusHandle>,
+        > = Default::default();
+    }
+
+    fn frame_focus<T: 'static>(entity: &Entity<T>) -> gpui::FocusHandle {
+        FRAME_FOCUS.with(|frames| {
+            frames
+                .borrow()
+                .get(&entity.entity_id())
+                .cloned()
+                .expect("the Input was rendered")
+        })
+    }
+
+    /// Focus events only fire in an active window, as on a real desktop.
+    fn activate(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+    }
+
+    fn draw(cx: &mut gpui::VisualTestContext) {
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    // DESKTOP-QA-20260923 bug 4: an assistive Focus request lands on the
+    // accessible frame's node, and gpui's built-in Focus action focuses the
+    // handle that node registered: the frame's, not the editor's. The frame
+    // must hand focus to the editor so typed text and Return (submit) reach it.
+    #[gpui::test]
+    fn focusing_the_accessible_frame_routes_keys_and_enter_to_the_editor(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use crate::Root;
+        use gpui::{AppContext as _, Focusable as _, Render};
+        use std::sync::{Arc, Mutex};
+
+        struct Probe {
+            textarea: Entity<crate::input::TextareaState>,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().child(crate::input::Textarea::new(&self.textarea))
+            }
+        }
+
+        cx.update(crate::init);
+        let mut textarea = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let state = cx.new(|cx| {
+                    crate::input::TextareaState::new(window, cx).submit_on_enter(true)
+                });
+                textarea = Some(state.clone());
+                let probe = cx.new(|_| Probe { textarea: state });
+                cx.new(|cx| Root::new(probe, window, cx))
+            })
+            .unwrap()
+        });
+        let textarea = textarea.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        activate(&mut cx);
+
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        cx.update(|_, cx| {
+            let submitted = submitted.clone();
+            cx.subscribe(&textarea, move |state, event: &gpui_base::input::InputEvent, cx| {
+                if let gpui_base::input::InputEvent::PressEnter { shift: false, .. } = event {
+                    submitted.lock().unwrap().push(state.read(cx).value().to_string());
+                }
+            })
+            .detach();
+        });
+
+        draw(&mut cx);
+        let frame = frame_focus(&textarea);
+        cx.update(|window, cx| frame.focus(window, cx));
+        draw(&mut cx);
+        draw(&mut cx);
+        assert!(
+            cx.update(|window, cx| textarea.focus_handle(cx).is_focused(window)),
+            "focus on the accessible frame reaches the editor's own focus handle"
+        );
+
+        // A value written through SetValue, then Return, submits it.
+        let base: TextInputState = textarea.clone().into();
+        let value = gpui::accesskit::ActionData::Value("hello".into());
+        cx.update(|window, cx| Input::handle_accessibility_set_value(&base, Some(&value), window, cx));
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        // The test platform also delivers Return's "\n" as text input, so
+        // compare the submitted draft the way the composer sends it.
+        let submitted: Vec<String> = submitted
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|value| value.trim().to_string())
+            .collect();
+        assert_eq!(submitted, vec!["hello".to_string()], "Return submits the draft");
+    }
+
+    // A disabled Input keeps its editor unfocused when its frame is focused.
+    #[gpui::test]
+    fn focusing_a_disabled_input_frame_leaves_the_editor_unfocused(cx: &mut gpui::TestAppContext) {
+        use crate::Root;
+        use gpui::{AppContext as _, Focusable as _, Render};
+
+        struct Probe {
+            input: Entity<crate::input::InputState>,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div().child(Input::new(&self.input).disabled(true))
+            }
+        }
+
+        cx.update(crate::init);
+        let mut input = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let state = cx.new(|cx| crate::input::InputState::new(window, cx));
+                input = Some(state.clone());
+                let probe = cx.new(|_| Probe { input: state });
+                cx.new(|cx| Root::new(probe, window, cx))
+            })
+            .unwrap()
+        });
+        let input = input.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+        activate(&mut cx);
+
+        draw(&mut cx);
+        let frame = frame_focus(&input);
+        cx.update(|window, cx| frame.focus(window, cx));
+        draw(&mut cx);
+        draw(&mut cx);
+        assert!(!cx.update(|window, cx| input.focus_handle(cx).is_focused(window)));
+    }
+
+    // Tab and Shift+Tab both leave a focused Input: the frame must not add a
+    // second tab-stop entry for the editor's handle.
+    #[gpui::test]
+    fn tab_and_shift_tab_leave_a_focused_input(cx: &mut gpui::TestAppContext) {
+        use crate::Root;
+        use gpui::{AppContext as _, Focusable as _, Render};
+
+        struct Probe {
+            input: Entity<crate::input::InputState>,
+            before: gpui::FocusHandle,
+            after: gpui::FocusHandle,
+        }
+        impl Render for Probe {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                div()
+                    .child(div().track_focus(&self.before))
+                    .child(Input::new(&self.input))
+                    .child(div().track_focus(&self.after))
+            }
+        }
+
+        cx.update(crate::init);
+        let mut slot = None;
+        let window = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                let input = cx.new(|cx| crate::input::InputState::new(window, cx));
+                let before = cx.focus_handle().tab_stop(true);
+                let after = cx.focus_handle().tab_stop(true);
+                slot = Some((input.clone(), before.clone(), after.clone()));
+                let probe = cx.new(|_| Probe {
+                    input,
+                    before,
+                    after,
+                });
+                cx.new(|cx| Root::new(probe, window, cx))
+            })
+            .unwrap()
+        });
+        let (input, before, after) = slot.unwrap();
+        let mut cx = gpui::VisualTestContext::from_window(window.into(), cx);
+
+        draw(&mut cx);
+        cx.update(|window, cx| input.focus_handle(cx).focus(window, cx));
+        draw(&mut cx);
+        draw(&mut cx);
+        cx.update(|window, cx| window.focus_prev(cx));
+        draw(&mut cx);
+        assert!(cx.update(|window, _| before.is_focused(window)), "Shift+Tab leaves the input");
+
+        cx.update(|window, cx| input.focus_handle(cx).focus(window, cx));
+        draw(&mut cx);
+        draw(&mut cx);
+        cx.update(|window, cx| window.focus_next(cx));
+        draw(&mut cx);
+        assert!(cx.update(|window, _| after.is_focused(window)), "Tab leaves the input");
     }
 
     #[test]
