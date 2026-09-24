@@ -3,6 +3,7 @@
 
 use crate::TestSupportExt as _;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     rc::Rc,
     sync::Arc,
@@ -11,9 +12,9 @@ use std::{
 use anyhow::Result;
 use gpui::{
     AnyElement, AnyView, App, AppContext as _, Axis, Bounds, Context, Div, Empty, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, ParentElement,
-    Pixels, Point, Render, SharedString, Stateful, Styled as _, Subscription, WeakEntity, Window,
-    div, prelude::FluentBuilder as _, px,
+    EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement,
+    ParentElement, Pixels, Point, Render, SharedString, Stateful, Styled as _, Subscription,
+    WeakEntity, Window, WindowHandle, WindowOptions, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -22,6 +23,7 @@ use crate::{
 };
 
 use super::{
+    detached::{DetachedDock, DetachedPanel, DetachedWindows},
     dock_placement::{Dock, DockSizing},
     drag::{AnyDrag, DropTarget},
     layout::{
@@ -113,6 +115,9 @@ pub struct DockArea {
     zoomed: Option<Zoomed>,
     focus_handle: FocusHandle,
     renderer: Rc<dyn DockAreaRenderer>,
+    /// The color a pop-out window paints behind its panels. The vendored
+    /// theme does not know the host's palette, so the host projects it here.
+    window_background: Option<Hsla>,
 }
 
 impl DockArea {
@@ -145,7 +150,14 @@ impl DockArea {
             zoomed: None,
             focus_handle: cx.focus_handle(),
             renderer: Rc::new(BareDockArea),
+            window_background: None,
         }
+    }
+
+    /// The color a window created by [`Self::pop_out_panel`] paints behind
+    /// its panels. `None` leaves the window's platform default.
+    pub fn set_window_background(&mut self, background: Hsla) {
+        self.window_background = Some(background);
     }
 
     /// Install the appearance for this area and everything under it: the
@@ -581,6 +593,31 @@ impl DockArea {
         self.commit(result, window, cx);
     }
 
+    /// Close `panel` from outside its tab strip: a host-owned strip names a
+    /// panel by identity with no group context of its own. Routes through
+    /// the holding group's guarded close, so the same refusals apply as the
+    /// × the group strip would have drawn. No-op when the panel is not
+    /// docked here. (Codewhale patch — see the `[patch.crates-io]` note in
+    /// the app's Cargo.toml.)
+    pub fn close_panel_by_id(
+        &mut self,
+        panel: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(placement) = self.placement_of_panel(panel) else {
+            return;
+        };
+        let node = self
+            .layout(placement)
+            .and_then(|tree| tree.find_panel_node(panel));
+        let Some(node) = node else {
+            return;
+        };
+        let group = self.group_entity(node, window, cx);
+        group.update(cx, |group, cx| group.close_panel(panel, cx));
+    }
+
     /// Put `panel` in a new tab group beside `node`.
     pub fn split_at(
         &mut self,
@@ -610,6 +647,248 @@ impl DockArea {
         };
         let result = tree.remove_panel(panel);
         self.commit(result, window, cx);
+    }
+
+    /// Raise `panel` to the front of wherever it already lives: select its
+    /// tab, or bring its tile forward. Opens a collapsed dock to show it.
+    /// No-op when the panel is not docked here.
+    ///
+    /// This is the host's "show me that panel" act — a palette pick or a
+    /// summon — and it is distinct from [`Self::move_panel`], which
+    /// relocates: the panel keeps its slot. Re-inserting through
+    /// `InsertTarget::Tabs { activate: true }` would surface it too, but at
+    /// the price of moving its tab to the end of the group. Activation is
+    /// selection, not relocation.
+    ///
+    /// Returns whether the panel was found. `true` even when nothing visibly
+    /// changed — already being its container's front still counts as
+    /// activated — so the answer doubles as "is this panel docked here?".
+    pub fn activate_panel(
+        &mut self,
+        panel: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(placement) = self.placement_of_panel(panel) else {
+            return false;
+        };
+
+        // Read, then edit: which edit raises the panel depends on the kind of
+        // container holding it, and the tree answers that through a shared
+        // borrow the mutation cannot overlap.
+        let found = self.layout(placement).and_then(|tree| {
+            let node = tree.find_panel_node(panel)?;
+            match tree.find_node(node)?.kind() {
+                PaneRef::Tabs { panels, .. } => {
+                    panels.iter().position(|p| *p == panel).map(|ix| (node, ix))
+                }
+                PaneRef::Split { .. } => None,
+            }
+        });
+        let Some((node, tab_ix)) = found else {
+            return false;
+        };
+
+        let mut changed = self
+            .tree_mut(placement)
+            .is_some_and(|tree| tree.set_active(node, tab_ix).changed());
+
+        // Selecting the tab does not show it while the whole region is off
+        // screen: a closed dock reports its panels as hidden, so activation
+        // re-opens it — `toggle_dock` in the one direction it can only go.
+        if let Some(region) = self.docks.get_mut(&placement) {
+            if !region.dock.is_open() {
+                region.dock.set_open(true);
+                changed = true;
+            }
+        }
+
+        self.commit_changed(changed, window, cx);
+        true
+    }
+}
+
+/// Detaching panels out of the area — for a pop-out window or a move to
+/// another area.
+///
+/// A detach is a move, not a close: it honors the same contract as
+/// [`Self::move_panel`], so the panel is never told [`Panel::on_removed`].
+/// What makes the move work across windows is that the panel's entity is
+/// app-global rather than window-bound — the [`DetachedPanel`] carries the
+/// live view handle, and a `DockArea` in another window can adopt it as-is.
+impl DockArea {
+    /// Take `panel` out of the layout without retiring it.
+    ///
+    /// The returned [`DetachedPanel`] holds the live view, the [`PanelState`]
+    /// the panel dumped at detach time, and the region it came from.
+    /// [`Self::adopt_detached`] puts it into this or any other area;
+    /// [`Self::pop_out_panel`] does both ends of a move to a new OS window.
+    ///
+    /// `None` if the panel is not in this area.
+    pub fn detach_panel(
+        &mut self,
+        panel: PanelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<DetachedPanel> {
+        let region = self.placement_of_panel(panel)?;
+        let view = self.panels.get(&panel)?.clone();
+        // Dumped while the view is still guaranteed live: it is the only
+        // `PanelState` a host persisting a detached window can get.
+        let state = view.dump(cx);
+        let result = self.tree_mut(region)?.remove_panel(panel);
+        if !result.changed() {
+            return None;
+        }
+        // The view leaves the map *before* reconcile runs: reconcile tells
+        // every entry it prunes `on_removed`, and a panel that is moving to
+        // another area must not hear it — exactly the rule `move_panel`
+        // follows for its cross-tree case.
+        self.panels.remove(&panel);
+        self.commit(result, window, cx);
+        Some(DetachedPanel::new(panel, view, state, region))
+    }
+
+    /// Insert a panel detached from this or another area.
+    ///
+    /// Where it lands inside `placement` is the region's own choice — the
+    /// first tab group, or a fresh group in an empty region — the same
+    /// resolution [`Self::add_panel_view`] applies, which is what this calls
+    /// through. `size` seeds a dock that does not exist yet, exactly as in
+    /// [`Self::add_panel`].
+    pub fn adopt_detached(
+        &mut self,
+        detached: DetachedPanel,
+        placement: DockPlacement,
+        size: Option<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let id = detached.panel_id();
+        self.add_panel_inner(id, detached.into_view(), placement, size, window, cx);
+    }
+
+    /// Pop `panel` out of this area into a new OS window.
+    ///
+    /// The window's root is a [`DetachedDock`]: a second `DockArea` holding
+    /// the panel, drawn with this area's own renderer, which re-docks every
+    /// panel it still holds into this area — each at the region it left —
+    /// when the window closes. `options` comes from the host, which decides
+    /// bounds and titlebar.
+    ///
+    /// `Err` when the panel is not in this area or the window cannot be
+    /// opened; a failed open leaves the panel back where it was.
+    pub fn pop_out_panel(
+        &mut self,
+        panel: PanelId,
+        options: WindowOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<WindowHandle<DetachedDock>> {
+        let Some(detached) = self.detach_panel(panel, window, cx) else {
+            anyhow::bail!("panel {panel:?} is not in this dock area");
+        };
+        let home = self.this.clone();
+        let renderer = self.renderer.clone();
+        let background = self.window_background;
+        // The title the host gave the window doubles as the pop-out's header
+        // label — it is the one display string this layer cannot invent.
+        let title = options
+            .titlebar
+            .as_ref()
+            .and_then(|titlebar| titlebar.title.clone());
+        let id = SharedString::from(format!("{}-detached-{}", self.id, panel.as_u64()));
+        let version = self.version;
+        // The panel is hosted at `Center` in the pop-out, so the region it
+        // actually left has to be carried to the root — otherwise closing the
+        // window would re-dock it to `Center` at home.
+        let origin = (detached.panel_id(), detached.from());
+        // Shared with the build closure because `open_window` only invokes it
+        // when the platform window actually came up: on failure the panel is
+        // still in the cell here, to be adopted back rather than dropped with
+        // the closure.
+        let pending = Rc::new(RefCell::new(Some(detached)));
+        let moved = pending.clone();
+        let opened = cx.open_window(options, move |window, cx| {
+            let area =
+                cx.new(|cx| DockArea::new(id.clone(), version, window, cx).with_renderer(renderer));
+            if let Some(detached) = moved.borrow_mut().take() {
+                area.update(cx, |area, cx| {
+                    area.adopt_detached(detached, DockPlacement::Center, None, window, cx);
+                });
+            }
+            let root = cx.new(|cx| {
+                let mut dock = DetachedDock::new(area, home, background, title, cx);
+                dock.remember_origin(origin.0, origin.1);
+                dock
+            });
+            let weak = root.downgrade();
+            // Registered while the window is actually coming up — the only
+            // moment this layer can name the root — so a host's
+            // `DetachedWindows::live`/`redock_all` sees every pop-out without
+            // each caller keeping its own list.
+            DetachedWindows::register(root.downgrade(), cx);
+            // Re-dock before the window goes away: entities drop with their
+            // root, and a panel still living only here would go with them.
+            window.on_window_should_close(cx, move |window, cx| {
+                _ = weak.update(cx, |detached, cx| detached.redock_home(window, cx));
+                true
+            });
+            root
+        });
+
+        match opened {
+            Ok(handle) => Ok(handle),
+            Err(error) => {
+                // The window never came up, so put the panel back where it
+                // was rather than dropping a live view the caller still owns.
+                if let Some(detached) = pending.borrow_mut().take() {
+                    let from = detached.from();
+                    self.adopt_detached(detached, from, None, window, cx);
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Every panel the area holds, each paired with the region it lives in.
+    ///
+    /// Center first, then the docks, each region's panels in tree order. The
+    /// inventory [`DetachedDock`] walks to hand its contents back on close,
+    /// and what a host persisting a multi-window layout iterates to place
+    /// every live panel.
+    pub fn placed_panels(&self) -> Vec<(PanelId, DockPlacement)> {
+        let mut placed: Vec<(PanelId, DockPlacement)> = self
+            .center
+            .panels()
+            .map(|panel| (panel, DockPlacement::Center))
+            .collect();
+        for (placement, region) in &self.docks {
+            placed.extend(region.tree.panels().map(|panel| (panel, *placement)));
+        }
+        placed
+    }
+
+    /// The panel the user is looking at in a region — the active tab of the
+    /// first tab group the walk reaches. `None` when the region holds
+    /// nothing.
+    ///
+    /// This is the target for acts that follow attention — "detach the panel
+    /// I'm looking at" — where [`Self::placed_panels`] can only name the
+    /// first panel in tree order.
+    pub fn active_panel_at(&self, placement: DockPlacement) -> Option<PanelId> {
+        let tree = self.layout(placement)?;
+        let mut found = None;
+        tree.root().walk(&mut |node| {
+            if found.is_some() {
+                return;
+            }
+            found = match node.kind() {
+                PaneRef::Tabs { panels, active_ix } => panels.get(active_ix).copied(),
+                PaneRef::Split { .. } => None,
+            };
+        });
+        found
     }
 }
 
@@ -893,9 +1172,15 @@ impl DockArea {
         // Planned first, applied second: the plan borrows the trees, and
         // applying it needs `&mut self` to fill the caches.
         let mut plans = Vec::new();
-        plan_tree(&self.center, false, self.locked, &mut plans);
+        plan_tree(&self.center, true, false, self.locked, &mut plans);
         for pane in self.docks.values() {
-            plan_tree(&pane.tree, !pane.dock.is_open(), self.locked, &mut plans);
+            plan_tree(
+                &pane.tree,
+                false,
+                !pane.dock.is_open(),
+                self.locked,
+                &mut plans,
+            );
         }
 
         // Sets rather than vectors: these are membership tests, run once per
@@ -1589,9 +1874,16 @@ fn sync_split_panels(
     );
 }
 
-fn plan_tree(tree: &PaneTree, collapsed: bool, locked: bool, out: &mut Vec<ContainerPlan>) {
-    // The root has nothing beside it by definition.
-    plan_node(tree.root(), true, collapsed, locked, out);
+fn plan_tree(
+    tree: &PaneTree,
+    alone: bool,
+    collapsed: bool,
+    locked: bool,
+    out: &mut Vec<ContainerPlan>,
+) {
+    // A side region has the center beside it: its last tab can move or close.
+    // Only the center root must retain its last visible panel.
+    plan_node(tree.root(), alone, collapsed, locked, out);
 }
 
 fn plan_node(
@@ -1613,7 +1905,7 @@ fn plan_node(
                 children: children.iter().map(PaneNode::id).collect(),
                 sizes: sizes.to_vec(),
             });
-            let children_alone = children.len() <= 1;
+            let children_alone = alone && children.len() <= 1;
             for child in children {
                 plan_node(child, children_alone, collapsed, locked, out);
             }
@@ -4068,6 +4360,435 @@ mod tests {
         assert!(
             !cx.read(|cx| area.read(cx).is_zoomed()),
             "the area must not fill itself with a group that never zoomed"
+        );
+    }
+
+    /// `active_panel_at` answers with the tab the user is looking at, not the
+    /// first panel the tree happens to hold.
+    #[gpui::test]
+    fn active_panel_at_names_the_active_tab(cx: &mut TestAppContext) {
+        let (area, cx) = setup(cx);
+        let (first, second) = cx.update(|window, cx| {
+            let first = TestPanel::new("First", cx);
+            let second = TestPanel::new("Second", cx);
+            area.update(cx, |area, cx| {
+                area.set_dock(
+                    DockPlacement::Right,
+                    DockLayout::tabs()
+                        .panel(first.clone())
+                        .panel(second.clone())
+                        .active_index(1),
+                    window,
+                    cx,
+                );
+            });
+            (first, second)
+        });
+        cx.run_until_parked();
+
+        let first_id = PanelId::from(first.entity_id());
+        let second_id = PanelId::from(second.entity_id());
+        assert_eq!(
+            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Right)),
+            Some(second_id),
+            "the region's active tab is what detach should take"
+        );
+        assert_ne!(
+            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Right)),
+            Some(first_id)
+        );
+        assert_eq!(
+            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Left)),
+            None,
+            "a region that holds nothing has no active panel"
+        );
+    }
+
+    /// `activate_panel` selects the tab where it sits: a move would have
+    /// relocated it to the tail of the group, which is not what "show me
+    /// that panel" means.
+    #[gpui::test]
+    fn activate_panel_selects_a_background_tab_in_place(cx: &mut TestAppContext) {
+        let (area, cx) = setup(cx);
+        let (first, second) = cx.update(|window, cx| {
+            let first = TestPanel::new("First", cx);
+            let second = TestPanel::new("Second", cx);
+            area.update(cx, |area, cx| {
+                area.set_center(
+                    DockLayout::tabs()
+                        .panel(first.clone())
+                        .panel(second.clone()),
+                    window,
+                    cx,
+                );
+            });
+            (first, second)
+        });
+        cx.run_until_parked();
+
+        let first_id = panel_id_of(&first);
+        let second_id = panel_id_of(&second);
+        let activated = cx.update(|window, cx| {
+            area.update(cx, |area, cx| area.activate_panel(second_id, window, cx))
+        });
+        cx.run_until_parked();
+
+        assert!(activated);
+        assert_eq!(
+            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Center)),
+            Some(second_id),
+            "the background tab is now the displayed one"
+        );
+
+        // Selection, not re-insertion: the tab order the group was built
+        // with survives, and only the index flipped.
+        cx.read(|cx| {
+            let tree = area.read(cx).layout(DockPlacement::Center).unwrap();
+            let node = tree.find_panel_node(second_id).unwrap();
+            let PaneRef::Tabs { panels, active_ix } = tree.find_node(node).unwrap().kind() else {
+                panic!("the panel lives in a tab group");
+            };
+            assert_eq!(panels, [first_id, second_id]);
+            assert_eq!(active_ix, 1);
+        });
+    }
+
+    /// A selected tab inside a collapsed dock is still hidden — the region
+    /// reports its displayed panel as off screen — so activation has to open
+    /// the dock, not just flip the index.
+    #[gpui::test]
+    fn activate_panel_opens_a_collapsed_dock(cx: &mut TestAppContext) {
+        let log = log_of();
+        let (area, cx) = setup(cx);
+        let docked = cx.update(|window, cx| {
+            let docked = TestPanel::logging("Docked", &log, cx);
+            area.update(cx, |area, cx| {
+                area.set_dock(
+                    DockPlacement::Right,
+                    DockLayout::tabs().panel(docked.clone()),
+                    window,
+                    cx,
+                );
+                area.toggle_dock(DockPlacement::Right, window, cx);
+            });
+            docked
+        });
+        cx.run_until_parked();
+        assert!(
+            !cx.read(|cx| area.read(cx).is_dock_open(DockPlacement::Right)),
+            "the dock starts collapsed"
+        );
+        drain(&log);
+
+        let docked_id = panel_id_of(&docked);
+        let activated = cx.update(|window, cx| {
+            area.update(cx, |area, cx| area.activate_panel(docked_id, window, cx))
+        });
+        cx.run_until_parked();
+
+        assert!(activated);
+        assert!(
+            cx.read(|cx| area.read(cx).is_dock_open(DockPlacement::Right)),
+            "activation opened the dock that was hiding the panel"
+        );
+        assert_eq!(
+            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Right)),
+            Some(docked_id)
+        );
+        // Re-opening puts the displayed panel back on screen, which the
+        // active-state contract counts as the panel being displayed again.
+        assert_eq!(drain_active(&log), [("Docked", true)]);
+    }
+
+    /// On a canvas there is no tab to select; activation is the raise the
+    /// canvas's own bring-to-front gesture reports.
+    #[gpui::test]
+    fn activate_panel_raises_a_tile_above_its_peers(cx: &mut TestAppContext) {
+        let (area, cx) = setup(cx);
+        let bounds = Bounds {
+            origin: gpui::point(px(10.), px(10.)),
+            size: gpui::size(px(200.), px(200.)),
+        };
+        let (under, over) = cx.update(|window, cx| {
+            let under = TestPanel::new("Under", cx);
+            let over = TestPanel::new("Over", cx);
+            area.update(cx, |area, cx| {
+                area.set_center(
+                    DockLayout::tiles()
+                        .tile(under.clone(), bounds)
+                        .tile(over.clone(), bounds),
+                    window,
+                    cx,
+                );
+            });
+            (under, over)
+        });
+        cx.run_until_parked();
+
+        // Tiles stack in placement order, so the second one starts on top.
+        assert_eq!(
+            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Center)),
+            Some(panel_id_of(&over))
+        );
+
+        let under_id = panel_id_of(&under);
+        let activated = cx.update(|window, cx| {
+            area.update(cx, |area, cx| area.activate_panel(under_id, window, cx))
+        });
+        cx.run_until_parked();
+
+        assert!(activated);
+        assert_eq!(
+            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Center)),
+            Some(under_id),
+            "the raised tile is now the front one"
+        );
+    }
+
+    /// A panel the dock does not hold must be a true no-op — no edit, no
+    /// collapsed dock opened, not even a layout event for a persisting
+    /// subscriber to act on.
+    #[gpui::test]
+    fn activate_panel_ignores_an_unknown_panel(cx: &mut TestAppContext) {
+        let (area, cx) = setup(cx);
+        cx.update(|window, cx| {
+            area.update(cx, |area, cx| {
+                area.set_dock(
+                    DockPlacement::Right,
+                    DockLayout::tabs().panel(TestPanel::new("Docked", cx)),
+                    window,
+                    cx,
+                );
+                area.toggle_dock(DockPlacement::Right, window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let events = Rc::new(Cell::new(0));
+        let observed = events.clone();
+        let _subscription = cx.update(|window, cx| {
+            window.subscribe(&area, cx, move |_, event: &DockEvent, _, _| {
+                if matches!(event, DockEvent::LayoutChanged) {
+                    observed.set(observed.get() + 1);
+                }
+            })
+        });
+
+        let activated = cx.update(|window, cx| {
+            area.update(cx, |area, cx| {
+                area.activate_panel(PanelId::from_u64(u64::MAX), window, cx)
+            })
+        });
+
+        assert!(!activated, "the panel is not docked here");
+        assert_eq!(events.get(), 0, "nothing changed, so nothing was emitted");
+        assert!(
+            !cx.read(|cx| area.read(cx).is_dock_open(DockPlacement::Right)),
+            "the collapsed dock stayed collapsed"
+        );
+    }
+
+    gpui::actions!(dock_key_dispatch_test, [WorkspaceChord]);
+
+    /// A host root the way Codewhale's workspace builds one: a single div
+    /// carrying the "Workspace" key context, the root focus handle and the
+    /// global action listeners, with the dock as a child. Global bindings
+    /// like ⌘K are registered against "Workspace"; they only reach the
+    /// listener while the dispatch path of whatever holds focus passes
+    /// through this node.
+    struct WorkspaceRoot {
+        root_focus: FocusHandle,
+        dock: Entity<DockArea>,
+        fired: Rc<Cell<usize>>,
+    }
+
+    impl Render for WorkspaceRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let fired = self.fired.clone();
+            div()
+                .key_context("Workspace")
+                .track_focus(&self.root_focus)
+                .on_action(move |_: &WorkspaceChord, _, _| {
+                    fired.set(fired.get() + 1);
+                })
+                .child(self.dock.clone())
+        }
+    }
+
+    /// Focus inside a docked panel must not sever the dispatch path to the
+    /// workspace root: a focused panel is a descendant of the root's node, so
+    /// its context stack still contains "Workspace" and the action listener
+    /// bubbles up to it.
+    #[gpui::test]
+    fn workspace_actions_reach_a_focused_docked_panel(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let _ = crate::Theme::global_mut(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "cmd-k",
+                WorkspaceChord,
+                Some("Workspace"),
+            )]);
+        });
+
+        let fired = Rc::new(Cell::new(0));
+        let fired_for_view = fired.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| WorkspaceRoot {
+            root_focus: cx.focus_handle(),
+            dock: cx.new(|cx| DockArea::new("test-dock", None, window, cx)),
+            fired: fired_for_view,
+        });
+
+        let panel = cx.update(|window, cx| {
+            let panel = TestPanel::new("Alpha", cx);
+            let dock = view.read(cx).dock.clone();
+            dock.update(cx, |area, cx| {
+                area.set_center(DockLayout::tabs().panel(panel.clone()), window, cx);
+            });
+            panel
+        });
+        cx.run_until_parked();
+
+        // What clicking into a docked panel does: the panel's own focus
+        // handle takes the window's focus.
+        cx.update(|window, cx| {
+            panel.read(cx).focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-k");
+        assert_eq!(
+            fired.get(),
+            1,
+            "the workspace action fired while a docked panel held focus"
+        );
+    }
+
+    /// A panel carrying a nested focusable — the shape a docked panel with a
+    /// text field takes: the panel's own handle plus a deeper one inside its
+    /// rendered content.
+    struct PanelWithField {
+        focus_handle: FocusHandle,
+        field_focus: FocusHandle,
+    }
+
+    impl Panel for PanelWithField {
+        fn panel_name(&self) -> &'static str {
+            "Fielded"
+        }
+    }
+
+    impl EventEmitter<PanelEvent> for PanelWithField {}
+
+    impl Focusable for PanelWithField {
+        fn focus_handle(&self, _: &App) -> FocusHandle {
+            self.focus_handle.clone()
+        }
+    }
+
+    impl Render for PanelWithField {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .child(div().size_full().track_focus(&self.field_focus))
+        }
+    }
+
+    /// Focus on a field *inside* a docked panel must keep the workspace
+    /// context too — the input's node sits deeper than the group frame, but
+    /// the path still runs up through the root.
+    #[gpui::test]
+    fn workspace_actions_reach_focus_inside_a_docked_panel(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let _ = crate::Theme::global_mut(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "cmd-k",
+                WorkspaceChord,
+                Some("Workspace"),
+            )]);
+        });
+
+        let fired = Rc::new(Cell::new(0));
+        let fired_for_view = fired.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| WorkspaceRoot {
+            root_focus: cx.focus_handle(),
+            dock: cx.new(|cx| DockArea::new("test-dock", None, window, cx)),
+            fired: fired_for_view,
+        });
+
+        let panel = cx.update(|window, cx| {
+            let panel = cx.new(|cx| PanelWithField {
+                focus_handle: cx.focus_handle(),
+                field_focus: cx.focus_handle(),
+            });
+            let dock = view.read(cx).dock.clone();
+            dock.update(cx, |area, cx| {
+                area.set_center(DockLayout::tabs().panel(panel.clone()), window, cx);
+            });
+            panel
+        });
+        cx.run_until_parked();
+
+        // What a text field inside the panel does on mousedown.
+        cx.update(|window, cx| {
+            let field_focus = panel.read(cx).field_focus.clone();
+            field_focus.focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-k");
+        assert_eq!(
+            fired.get(),
+            1,
+            "the workspace action fired while a field inside a docked panel held focus"
+        );
+    }
+
+    /// The same, but for a panel that lives in a side dock rather than the
+    /// center — the layout the summoned modules land in.
+    #[gpui::test]
+    fn workspace_actions_reach_a_focused_side_dock_panel(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let _ = crate::Theme::global_mut(cx);
+            cx.bind_keys([gpui::KeyBinding::new(
+                "cmd-k",
+                WorkspaceChord,
+                Some("Workspace"),
+            )]);
+        });
+
+        let fired = Rc::new(Cell::new(0));
+        let fired_for_view = fired.clone();
+        let (view, cx) = cx.add_window_view(|window, cx| WorkspaceRoot {
+            root_focus: cx.focus_handle(),
+            dock: cx.new(|cx| DockArea::new("test-dock", None, window, cx)),
+            fired: fired_for_view,
+        });
+
+        let panel = cx.update(|window, cx| {
+            let panel = TestPanel::new("Alpha", cx);
+            let dock = view.read(cx).dock.clone();
+            dock.update(cx, |area, cx| {
+                area.set_dock(
+                    DockPlacement::Right,
+                    DockLayout::tabs().panel(panel.clone()),
+                    window,
+                    cx,
+                );
+            });
+            panel
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            panel.read(cx).focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("cmd-k");
+        assert_eq!(
+            fired.get(),
+            1,
+            "the workspace action fired while a side-dock panel held focus"
         );
     }
 }
