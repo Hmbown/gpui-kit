@@ -167,6 +167,7 @@
 //! `crates/component/src/dock` is the production skin over the same seam.
 
 mod active;
+mod detached;
 mod dock_area;
 mod dock_placement;
 mod drag;
@@ -179,6 +180,7 @@ mod tab_group;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub use detached::{CloseDetached, DetachedDock, DetachedPanel, DetachedWindows};
 pub use dock_area::{DockArea, DockAreaRenderer, DockContext, DockEvent};
 pub use dock_placement::{Dock, DockSizing};
 pub use drag::{AnyDrag, DragPanel, DropIndicator, DropPlaceholderBounds, DropTarget};
