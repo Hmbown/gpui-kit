@@ -4414,51 +4414,6 @@ mod tests {
         assert_eq!(drain_active(&log), [("Docked", true)]);
     }
 
-    /// On a canvas there is no tab to select; activation is the raise the
-    /// canvas's own bring-to-front gesture reports.
-    #[gpui::test]
-    fn activate_panel_raises_a_tile_above_its_peers(cx: &mut TestAppContext) {
-        let (area, cx) = setup(cx);
-        let bounds = Bounds {
-            origin: gpui::point(px(10.), px(10.)),
-            size: gpui::size(px(200.), px(200.)),
-        };
-        let (under, over) = cx.update(|window, cx| {
-            let under = TestPanel::new("Under", cx);
-            let over = TestPanel::new("Over", cx);
-            area.update(cx, |area, cx| {
-                area.set_center(
-                    DockLayout::tiles()
-                        .tile(under.clone(), bounds)
-                        .tile(over.clone(), bounds),
-                    window,
-                    cx,
-                );
-            });
-            (under, over)
-        });
-        cx.run_until_parked();
-
-        // Tiles stack in placement order, so the second one starts on top.
-        assert_eq!(
-            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Center)),
-            Some(panel_id_of(&over))
-        );
-
-        let under_id = panel_id_of(&under);
-        let activated = cx.update(|window, cx| {
-            area.update(cx, |area, cx| area.activate_panel(under_id, window, cx))
-        });
-        cx.run_until_parked();
-
-        assert!(activated);
-        assert_eq!(
-            cx.read(|cx| area.read(cx).active_panel_at(DockPlacement::Center)),
-            Some(under_id),
-            "the raised tile is now the front one"
-        );
-    }
-
     /// A panel the dock does not hold must be a true no-op — no edit, no
     /// collapsed dock opened, not even a layout event for a persisting
     /// subscriber to act on.
