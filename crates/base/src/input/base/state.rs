@@ -1939,6 +1939,14 @@ impl<M: InputModeKind> InputBaseState<M> {
     }
 
     pub(super) fn enter(&mut self, action: &Enter, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter during an IME composition belongs to the IME: it commits the
+        // chosen candidate through `replace_text_in_range`. Emitting
+        // `PressEnter` here would make a submit-on-enter host (a chat box)
+        // send the half-composed message. Consume the action and do nothing.
+        if self.ime_marked_range.is_some() {
+            return;
+        }
+
         if M::handle_context_menu_action(self, Box::new(action.clone()), window, cx) {
             return;
         }
@@ -7105,6 +7113,66 @@ mod tests {
                 assert_eq!(state.ime_marked_range, Some((7..9).into()));
             });
         });
+    }
+
+    /// Enter while an IME composition is active must not emit `PressEnter`
+    /// (a submit-on-enter host would send mid-composition) nor insert a
+    /// newline; once the IME commits, Enter submits as usual.
+    #[gpui::test]
+    fn enter_while_composing_does_not_emit_press_enter(cx: &mut TestAppContext) {
+        use std::{cell::RefCell, rc::Rc};
+
+        let input_view = InputView::build_textarea(cx, |state| state.submit_on_enter(true));
+        let mut cx = VisualTestContext::from_window(input_view.window_handle.into(), cx);
+        let input = input_view.input;
+
+        let presses = Rc::new(RefCell::new(Vec::<String>::new()));
+        let _subscription = cx.update(|_, cx| {
+            let presses = presses.clone();
+            cx.subscribe(&input, move |state, event: &InputEvent, cx| {
+                if let InputEvent::PressEnter { .. } = event {
+                    presses
+                        .borrow_mut()
+                        .push(state.read(cx).value().to_string());
+                }
+            })
+        });
+
+        let enter = Enter {
+            secondary: false,
+            shift: false,
+        };
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                state.replace_and_mark_text_in_range(None, "n", None, window, cx);
+                state.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+                assert!(state.ime_marked_range.is_some());
+                state.enter(&enter, window, cx);
+                state.enter(
+                    &Enter {
+                        secondary: false,
+                        shift: true,
+                    },
+                    window,
+                    cx,
+                );
+                assert_eq!(state.value(), "ni", "no newline while composing");
+                assert!(state.ime_marked_range.is_some(), "composition untouched");
+            });
+        });
+        cx.run_until_parked();
+        assert!(presses.borrow().is_empty(), "no PressEnter while composing");
+
+        cx.update(|window, cx| {
+            input.update(cx, |state, cx| {
+                // The IME commits the candidate; the next Enter submits.
+                state.replace_text_in_range(None, "你", window, cx);
+                assert!(state.ime_marked_range.is_none());
+                state.enter(&enter, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(*presses.borrow(), vec!["你".to_string()]);
     }
 
     #[gpui::test]
