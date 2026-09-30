@@ -205,16 +205,23 @@ impl ResizableState {
         cx: &mut Context<Self>,
     ) {
         let size = bounds.size.along(self.axis);
+        let panel = &mut self.panels[panel_ix];
+        let mut changed = panel.bounds != bounds || panel.size_range != size_range;
         // This check is only necessary to stop the very first panel from resizing on its own
         // it needs to be passed when the panel is freshly created so we get the initial size,
         // but its also fine when it sometimes passes later.
         if self.sizes[panel_ix].as_f32() == PANEL_MIN_SIZE.as_f32() {
+            changed |= self.sizes[panel_ix] != size || panel.size != Some(size);
             self.sizes[panel_ix] = size;
-            self.panels[panel_ix].size = Some(size);
+            panel.size = Some(size);
         }
-        self.panels[panel_ix].bounds = bounds;
-        self.panels[panel_ix].size_range = size_range;
-        cx.notify();
+        panel.bounds = bounds;
+        panel.size_range = size_range;
+        // Runs in every prepaint. Notifying an unchanged measurement would
+        // schedule another frame for each window showing this state, forever.
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Remove the panel at `panel_ix` and redistribute the remaining space.
@@ -503,6 +510,84 @@ mod tests {
         let followup = cx.debug_bounds("cs-sidebar").unwrap().size.width;
 
         assert_eq!(followup, settled, "settling frame must not be pending");
+    }
+
+    struct SharedStateHarness {
+        state: gpui::Entity<ResizableState>,
+        measure: bool,
+    }
+
+    impl Render for SharedStateHarness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                h_resizable("shared-state")
+                    .with_state(&self.state)
+                    .measure(self.measure)
+                    .child(resizable_panel().size(px(240.)).child(div().size_full()))
+                    .child(resizable_panel().child(div().size_full())),
+            )
+        }
+    }
+
+    /// One state drawn in two differently sized windows holds one
+    /// measurement. With both windows measuring, each draw made the other
+    /// window's layout stale and the pair redrew each other without end.
+    /// Only the measuring window writes geometry now, and both settle.
+    #[gpui::test]
+    fn a_state_shared_by_two_windows_settles_on_the_measuring_window(cx: &mut TestAppContext) {
+        let state = cx.update(|cx| cx.new(|_| ResizableState::default()));
+        let notifications = Rc::new(Cell::new(0usize));
+        let _observer = cx.update(|cx| {
+            let notifications = notifications.clone();
+            cx.observe(&state, move |_, _| {
+                let n = notifications.get() + 1;
+                notifications.set(n);
+                assert!(
+                    n < 64,
+                    "a shared split state keeps notifying: its windows never settle"
+                );
+            })
+        });
+        let wide = cx.open_window(size(px(1200.), px(300.)), {
+            let state = state.clone();
+            move |_, _| SharedStateHarness {
+                state,
+                measure: true,
+            }
+        });
+        let narrow = cx.open_window(size(px(700.), px(300.)), {
+            let state = state.clone();
+            move |_, _| SharedStateHarness {
+                state,
+                measure: false,
+            }
+        });
+        let handles = [*wide, *narrow];
+        let draw_both = |cx: &mut TestAppContext| {
+            for handle in handles {
+                cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            }
+            cx.run_until_parked();
+        };
+        for _ in 0..3 {
+            draw_both(cx);
+        }
+        let settled = notifications.get();
+        for _ in 0..3 {
+            draw_both(cx);
+        }
+
+        assert_eq!(
+            notifications.get(),
+            settled,
+            "drawing both windows again must not notify"
+        );
+        assert_eq!(
+            state.read_with(cx, |state, _| state.container_size()),
+            px(1200.),
+            "the measuring window's width is the one the state holds"
+        );
     }
 
     struct ResizableHarness {
