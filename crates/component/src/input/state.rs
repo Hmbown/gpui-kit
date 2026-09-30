@@ -326,10 +326,99 @@ pub(super) fn sync_focused_input_registry(
     let focused = state.focus_handle(cx).is_focused(window);
     Root::try_update(window, cx, |root, _, cx| {
         if focused {
-            root.focused_input = Some(state.clone());
+            if root.focused_input.as_ref() != Some(&state) {
+                root.focused_input = Some(state.clone());
+                cx.notify();
+            }
         } else if root.focused_input.as_ref() == Some(&state) {
             root.focused_input = None;
+            cx.notify();
         }
-        cx.notify();
     });
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::{AnyInputState, InputState, sync_focused_input_registry};
+    use crate::Root;
+    use gpui::{
+        AppContext as _, Context, Focusable as _, IntoElement, Render, TestAppContext,
+        VisualTestContext, Window, div,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    struct EmptyView;
+    impl Render for EmptyView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn focused_input_registry_only_notifies_on_registration_changes(cx: &mut TestAppContext) {
+        cx.update(crate::init);
+        let mut inputs = None;
+        let root = cx.update(|cx| {
+            cx.open_window(Default::default(), |window, cx| {
+                inputs = Some((
+                    cx.new(|cx| InputState::new(window, cx)),
+                    cx.new(|cx| InputState::new(window, cx)),
+                ));
+                let view = cx.new(|_| EmptyView);
+                cx.new(|cx| Root::new(view, window, cx))
+            })
+            .unwrap()
+        });
+        let (first, second) = inputs.unwrap();
+        let notifications = Rc::new(Cell::new(0));
+        let observation = cx.update(|cx| {
+            let count = notifications.clone();
+            let entity = root.update(cx, |_, _, cx| cx.entity()).unwrap();
+            cx.observe(&entity, move |_, _| count.set(count.get() + 1))
+        });
+        let cx = &mut VisualTestContext::from_window(root.into(), cx);
+        cx.update(|window, cx| {
+            window.activate_window();
+            first.focus_handle(cx).focus(window, cx);
+            sync_focused_input_registry(first.clone(), window, cx);
+        });
+        assert_eq!(notifications.get(), 1);
+        cx.update(|window, cx| {
+            for _ in 0..4 {
+                sync_focused_input_registry(first.clone(), window, cx);
+                sync_focused_input_registry(second.clone(), window, cx);
+            }
+        });
+        assert_eq!(
+            notifications.get(),
+            1,
+            "unchanged render registration is silent"
+        );
+        cx.update(|window, cx| {
+            second.focus_handle(cx).focus(window, cx);
+            sync_focused_input_registry(second.clone(), window, cx);
+            sync_focused_input_registry(first.clone(), window, cx);
+            assert_eq!(
+                Root::read(window, cx).focused_input,
+                Some(AnyInputState::from(second.clone()))
+            );
+        });
+        assert_eq!(
+            notifications.get(),
+            2,
+            "an old input cannot clear the new focused input"
+        );
+        cx.update(|window, cx| {
+            window.blur(cx);
+            sync_focused_input_registry(second.clone(), window, cx);
+            sync_focused_input_registry(second.clone(), window, cx);
+            assert_eq!(Root::read(window, cx).focused_input, None);
+        });
+        assert_eq!(
+            notifications.get(),
+            3,
+            "unregister exactly once when focus leaves"
+        );
+        drop(observation);
+    }
 }
