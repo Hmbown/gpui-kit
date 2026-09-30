@@ -8,7 +8,7 @@ use gpui::{
     EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, Pixels, Point,
     Render, ScrollHandle, ScrollWheelEvent, SharedString, Styled as _, Subscription,
-    UTF16Selection, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    UTF16Selection, Window, WindowId, actions, div, point, prelude::FluentBuilder as _, px,
 };
 use ropey::{Rope, RopeSlice};
 use serde::Deserialize;
@@ -388,6 +388,9 @@ pub struct InputBaseState<M: InputModeKind> {
     pub(super) input_bounds: Bounds<Pixels>,
     /// The text bounds
     pub(super) last_bounds: Option<Bounds<Pixels>>,
+    /// The window whose layout last wrote the geometry above. See
+    /// [`Self::measures_in`].
+    pub(super) geometry_window: Option<WindowId>,
     pub(super) last_selected_range: Option<CursorSelection>,
     pub(super) selecting: bool,
     /// Anchor point of an in-progress columnar (block) selection.
@@ -744,6 +747,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             mode: LayoutMode::default(),
             last_layout: None,
             last_bounds: None,
+            geometry_window: None,
             last_selected_range: None,
             column_select_start: None,
             last_cursor: None,
@@ -3575,6 +3579,26 @@ impl<M: InputModeKind> InputBaseState<M> {
         };
     }
 
+    /// Whether drawing in `window` may write this input's geometry: its
+    /// soft-wrap width, laid-out lines, bounds and scroll.
+    ///
+    /// A host can draw one state in several windows at different sizes. It
+    /// holds one geometry, and each window writing its own would leave the
+    /// other's stale, so the windows would redraw each other forever. The
+    /// window that last measured keeps measuring until another window is
+    /// active or it closes; the rest draw with the geometry it measured.
+    pub(super) fn measures_in(&self, window: &Window, cx: &App) -> bool {
+        let Some(owner) = self.geometry_window else {
+            return true;
+        };
+        owner == window.window_handle().window_id()
+            || window.is_window_active()
+            || !cx
+                .windows()
+                .iter()
+                .any(|handle| handle.window_id() == owner)
+    }
+
     pub(super) fn set_input_bounds(&mut self, new_bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
         let wrap_width_changed = self.input_bounds.size.width != new_bounds.size.width;
         self.input_bounds = new_bounds;
@@ -4949,6 +4973,100 @@ mod tests {
             let line = state.input_bounds;
             assert_eq!(line.center().y, px(30.), "line {line:?}");
         });
+    }
+
+    /// One textarea drawn in two differently sized windows holds one geometry.
+    /// When both windows wrote theirs at paint, each paint changed the
+    /// geometry the other had written, notified, and dirtied the other
+    /// window, so the pair redrew each other forever. The active window
+    /// measures; the other draws with its geometry, and both settle.
+    #[gpui::test]
+    fn test_textarea_shared_by_two_windows_settles(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+
+        cx.update(|cx| {
+            cx.set_global(Theme::default());
+            super::super::init(cx);
+        });
+        let mut input = None;
+        let wide = cx.open_window(size(px(900.), px(200.)), |window, cx| {
+            let state = cx.new(|cx| crate::input::TextareaState::new(window, cx));
+            input = Some(state.clone());
+            TestRoot(state)
+        });
+        let input = input.unwrap();
+        let narrow = cx.open_window(size(px(500.), px(200.)), {
+            let input = input.clone();
+            move |_, _| TestRoot(input)
+        });
+        let notifications = Rc::new(Cell::new(0usize));
+        let _subscription = cx.update(|cx| {
+            let notifications = notifications.clone();
+            cx.observe(&input, move |_, _| {
+                let n = notifications.get() + 1;
+                notifications.set(n);
+                assert!(
+                    n < 64,
+                    "a shared textarea keeps notifying: its windows never settle"
+                );
+            })
+        });
+        wide.update(cx, |_, window, cx| {
+            window.activate_window();
+            input.update(cx, |state, cx| {
+                state.set_value(
+                    "one textarea shown in two windows at two widths ".repeat(8),
+                    window,
+                    cx,
+                )
+            });
+        })
+        .unwrap();
+        let handles = [*wide, *narrow];
+        let draw_both = |cx: &mut TestAppContext| {
+            for handle in handles {
+                cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            }
+            cx.run_until_parked();
+        };
+        let measured = |cx: &mut TestAppContext| {
+            input.read_with(cx, |state, _| {
+                (
+                    state.geometry_window,
+                    state.last_bounds.map(|b| b.size.width),
+                )
+            })
+        };
+        for _ in 0..3 {
+            draw_both(cx);
+        }
+        let settled = notifications.get();
+        for _ in 0..3 {
+            draw_both(cx);
+        }
+        assert_eq!(
+            notifications.get(),
+            settled,
+            "drawing both windows again must not notify"
+        );
+        let (owner, width) = measured(cx);
+        assert_eq!(owner, Some(wide.window_id()));
+        assert!(
+            width.is_some_and(|w| w > px(500.)),
+            "the active wide window measures"
+        );
+
+        // Activating the other window hands measurement over to it.
+        narrow
+            .update(cx, |_, window, _| window.activate_window())
+            .unwrap();
+        for _ in 0..3 {
+            draw_both(cx);
+        }
+        let (owner, width) = measured(cx);
+        assert_eq!(owner, Some(narrow.window_id()));
+        assert!(width.is_some_and(|w| w <= px(500.)));
     }
 
     #[gpui::test]

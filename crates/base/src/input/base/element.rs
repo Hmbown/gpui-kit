@@ -2213,6 +2213,9 @@ pub(super) struct PrepaintState {
     /// First line of inline completion (painted after cursor on same line)
     ghost_first_line: Option<ShapedLine>,
     ghost_lines_height: Pixels,
+    /// Whether this window writes the state's geometry back at paint. See
+    /// `InputBaseState::measures_in`.
+    measures: bool,
 }
 
 impl PrepaintState {
@@ -2436,6 +2439,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
         });
 
         let state = self.state.read(cx);
+        let measures = state.measures_in(window, cx);
         let multi_line = state.is_multi_line();
         let text = state.text.clone();
         let is_empty = text.len() == 0;
@@ -2483,7 +2487,9 @@ impl<M: InputModeKind> Element for TextElement<M> {
             .map(|l| l.wrapping_indent != wrapping_indent)
             .unwrap_or(true);
 
-        if wrap_width_changed || wrapping_indent_changed {
+        // Another window's wrap stays: rewrapping here would change the lines
+        // that window laid out and draws from.
+        if measures && (wrap_width_changed || wrapping_indent_changed) {
             self.state.update(cx, |state, cx| {
                 state.display_map.on_layout_changed(wrap_width, cx);
                 state.display_map.set_wrapping_indent(wrapping_indent, cx);
@@ -2874,6 +2880,7 @@ impl<M: InputModeKind> Element for TextElement<M> {
             ghost_first_line,
             ghost_lines,
             ghost_lines_height,
+            measures,
         }
     }
 
@@ -3176,7 +3183,12 @@ impl<M: InputModeKind> Element for TextElement<M> {
             cx,
         );
 
+        let window_id = window.window_handle().window_id();
         self.state.update(cx, |state, cx| {
+            if !prepaint.measures {
+                return;
+            }
+            state.geometry_window = Some(window_id);
             let geometry_changed = state.last_bounds != Some(bounds)
                 || state.input_bounds != input_bounds
                 || state.scroll_size != prepaint.scroll_size
