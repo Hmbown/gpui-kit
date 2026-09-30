@@ -46,12 +46,12 @@ pub use gpui_base::dock::PanelView as BasePanelView;
 /// crate and handing it back with a different meaning is worse than dropping
 /// it. A skin reads a dock through [`DockContext`].
 pub use gpui_base::dock::{
-    AnyDrag, DockArea, DockAreaRenderer, DockAreaState, DockContext, DockEvent, DockLayout,
-    DockPlacement, DockSizing, DockState, DragPanel, DropIndicator, DropPlaceholderBounds,
-    DropTarget, EditResult, InsertTarget, NodeId, PaneNode, PaneRef, PaneTree, PanelBuildContext,
-    PanelBuilder, PanelEvent, PanelId, PanelInfo, PanelRegistry, PanelSource, PanelState, RootKind,
-    TabGroup, TabGroupConstraints, TabGroupContext, TabGroupEvent, TabGroupRenderer,
-    register_panel,
+    AnyDrag, CloseDetached, DetachedDock, DetachedPanel, DetachedWindows, DockArea,
+    DockAreaRenderer, DockAreaState, DockContext, DockEvent, DockLayout, DockPlacement, DockSizing,
+    DockState, DragPanel, DropIndicator, DropPlaceholderBounds, DropTarget, EditResult,
+    InsertTarget, NodeId, PaneNode, PaneRef, PaneTree, PanelBuildContext, PanelBuilder, PanelEvent,
+    PanelId, PanelInfo, PanelRegistry, PanelSource, PanelState, RootKind, TabGroup,
+    TabGroupConstraints, TabGroupContext, TabGroupEvent, TabGroupRenderer, register_panel,
 };
 pub use panel::*;
 pub use tab_panel::DragPanelPreview;

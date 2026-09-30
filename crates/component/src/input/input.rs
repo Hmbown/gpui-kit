@@ -1288,9 +1288,8 @@ mod tests {
         let mut textarea = None;
         let window = cx.update(|cx| {
             cx.open_window(Default::default(), |window, cx| {
-                let state = cx.new(|cx| {
-                    crate::input::TextareaState::new(window, cx).submit_on_enter(true)
-                });
+                let state =
+                    cx.new(|cx| crate::input::TextareaState::new(window, cx).submit_on_enter(true));
                 textarea = Some(state.clone());
                 let probe = cx.new(|_| Probe { textarea: state });
                 cx.new(|cx| Root::new(probe, window, cx))
@@ -1304,11 +1303,17 @@ mod tests {
         let submitted = Arc::new(Mutex::new(Vec::new()));
         cx.update(|_, cx| {
             let submitted = submitted.clone();
-            cx.subscribe(&textarea, move |state, event: &gpui_base::input::InputEvent, cx| {
-                if let gpui_base::input::InputEvent::PressEnter { shift: false, .. } = event {
-                    submitted.lock().unwrap().push(state.read(cx).value().to_string());
-                }
-            })
+            cx.subscribe(
+                &textarea,
+                move |state, event: &gpui_base::input::InputEvent, cx| {
+                    if let gpui_base::input::InputEvent::PressEnter { shift: false, .. } = event {
+                        submitted
+                            .lock()
+                            .unwrap()
+                            .push(state.read(cx).value().to_string());
+                    }
+                },
+            )
             .detach();
         });
 
@@ -1325,7 +1330,9 @@ mod tests {
         // A value written through SetValue, then Return, submits it.
         let base: TextInputState = textarea.clone().into();
         let value = gpui::accesskit::ActionData::Value("hello".into());
-        cx.update(|window, cx| Input::handle_accessibility_set_value(&base, Some(&value), window, cx));
+        cx.update(|window, cx| {
+            Input::handle_accessibility_set_value(&base, Some(&value), window, cx)
+        });
         cx.simulate_keystrokes("enter");
         cx.run_until_parked();
         // The test platform also delivers Return's "\n" as text input, so
@@ -1336,7 +1343,11 @@ mod tests {
             .iter()
             .map(|value| value.trim().to_string())
             .collect();
-        assert_eq!(submitted, vec!["hello".to_string()], "Return submits the draft");
+        assert_eq!(
+            submitted,
+            vec!["hello".to_string()],
+            "Return submits the draft"
+        );
     }
 
     // A disabled Input keeps its editor unfocused when its frame is focused.
@@ -1424,14 +1435,20 @@ mod tests {
         draw(&mut cx);
         cx.update(|window, cx| window.focus_prev(cx));
         draw(&mut cx);
-        assert!(cx.update(|window, _| before.is_focused(window)), "Shift+Tab leaves the input");
+        assert!(
+            cx.update(|window, _| before.is_focused(window)),
+            "Shift+Tab leaves the input"
+        );
 
         cx.update(|window, cx| input.focus_handle(cx).focus(window, cx));
         draw(&mut cx);
         draw(&mut cx);
         cx.update(|window, cx| window.focus_next(cx));
         draw(&mut cx);
-        assert!(cx.update(|window, _| after.is_focused(window)), "Tab leaves the input");
+        assert!(
+            cx.update(|window, _| after.is_focused(window)),
+            "Tab leaves the input"
+        );
     }
 
     #[test]

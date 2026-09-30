@@ -170,9 +170,10 @@ impl DetachedDock {
     /// name is the stable identity the summon means.
     pub fn hosts_panel_named(&self, name: &str, cx: &App) -> bool {
         let area = self.area.read(cx);
-        area.placed_panels()
-            .iter()
-            .any(|(id, _)| area.panel(*id).is_some_and(|view| view.panel_name(cx) == name))
+        area.placed_panels().iter().any(|(id, _)| {
+            area.panel(*id)
+                .is_some_and(|view| view.panel_name(cx) == name)
+        })
     }
 
     /// The title the header row leads with: the host's window title when one
@@ -225,9 +226,10 @@ impl DetachedDock {
                 all_home = false;
                 continue;
             }
-            let Some(detached) = self.area.update(cx, |area, cx| {
-                area.detach_panel(panel, window, cx)
-            }) else {
+            let Some(detached) = self
+                .area
+                .update(cx, |area, cx| area.detach_panel(panel, window, cx))
+            else {
                 continue;
             };
             // The recorded origin beats `from` here — inside this window the
@@ -344,11 +346,7 @@ impl DetachedWindows {
             .filter(|root| {
                 !root
                     .update_in(cx, |detached, pop_window, cx| {
-                        let home = detached.redock_home_inner(
-                            pop_window,
-                            Some(&mut *window),
-                            cx,
-                        );
+                        let home = detached.redock_home_inner(pop_window, Some(&mut *window), cx);
                         if home {
                             pop_window.remove_window();
                         }
@@ -450,11 +448,7 @@ impl Render for DetachedDock {
                             // lifts to the accent wash like a tab affordance.
                             .text_xs()
                             .text_color(colors.muted_foreground)
-                            .hover(|style| {
-                                style
-                                    .bg(colors.accent)
-                                    .text_color(colors.foreground)
-                            })
+                            .hover(|style| style.bg(colors.accent).text_color(colors.foreground))
                             .child(
                                 svg()
                                     .path("icons/panel-right.svg")
@@ -578,9 +572,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn an_adopted_panel_reenters_its_own_area_without_a_removed_edge(
-        cx: &mut TestAppContext,
-    ) {
+    fn an_adopted_panel_reenters_its_own_area_without_a_removed_edge(cx: &mut TestAppContext) {
         let log = log_of();
         let (area, alpha, _beta, cx) = two_groups(&log, cx);
         cx.run_until_parked();
@@ -732,9 +724,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn closing_the_pop_out_re_docks_to_the_region_the_panel_left(
-        cx: &mut TestAppContext,
-    ) {
+    fn closing_the_pop_out_re_docks_to_the_region_the_panel_left(cx: &mut TestAppContext) {
         let log = log_of();
         let (area, _alpha, _beta, cx) = two_groups(&log, cx);
         let gamma = cx.update(|window, cx| {
@@ -829,13 +819,12 @@ mod tests {
         cx.run_until_parked();
 
         assert!(
-            cx.update(|_window, cx| DetachedWindows::live(cx)).is_empty(),
+            cx.update(|_window, cx| DetachedWindows::live(cx))
+                .is_empty(),
             "a closed window drops out of the inventory without an unregister"
         );
         assert!(
-            pop_window
-                .update(&mut cx.cx, |_, _, _| ())
-                .is_err(),
+            pop_window.update(&mut cx.cx, |_, _, _| ()).is_err(),
             "and the window is really gone"
         );
     }
@@ -885,7 +874,8 @@ mod tests {
         assert!(panel_is_in(&area, alpha_id, Placement::Center, cx));
         assert!(panel_is_in(&area, beta_id, Placement::Center, cx));
         assert!(
-            cx.update(|_window, cx| DetachedWindows::live(cx)).is_empty(),
+            cx.update(|_window, cx| DetachedWindows::live(cx))
+                .is_empty(),
             "the inventory is empty once the windows are gone"
         );
         assert!(
