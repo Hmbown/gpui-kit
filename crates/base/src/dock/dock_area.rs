@@ -14,7 +14,8 @@ use gpui::{
     AnyElement, AnyView, App, AppContext as _, Axis, Bounds, Context, Div, Empty, Entity,
     EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement as _, IntoElement,
     ParentElement, Pixels, Point, Render, SharedString, Stateful, Styled as _, Subscription,
-    WeakEntity, Window, WindowHandle, WindowOptions, div, prelude::FluentBuilder as _, px,
+    WeakEntity, Window, WindowHandle, WindowId, WindowOptions, div, prelude::FluentBuilder as _,
+    px,
 };
 
 use crate::{
@@ -101,7 +102,15 @@ struct CachedSplit {
 pub struct DockArea {
     id: SharedString,
     version: Option<usize>,
+    /// Bounds in the measurement window, or in the last window painted when
+    /// none is named.
     bounds: Bounds<Pixels>,
+    /// Bounds in each window the area is drawn in. A dock resize measures
+    /// against the window the pointer is in.
+    window_bounds: HashMap<WindowId, Bounds<Pixels>>,
+    /// The one window whose layout writes measured split geometry. See
+    /// [`Self::set_measurement_window`].
+    measurement_window: Option<WindowId>,
     this: WeakEntity<Self>,
 
     center: PaneTree,
@@ -140,6 +149,8 @@ impl DockArea {
             id: id.into(),
             version,
             bounds: Bounds::default(),
+            window_bounds: HashMap::new(),
+            measurement_window: None,
             this: cx.weak_entity(),
             center: PaneTree::new(RootKind::Split),
             docks: HashMap::new(),
@@ -186,10 +197,46 @@ impl DockArea {
         cx.notify();
     }
 
-    /// The area's own bounds, recorded each frame. Dock resizing measures
-    /// against it.
+    /// The area's own bounds, recorded each frame in the measurement window
+    /// (in whichever window painted last when none is named).
     pub fn bounds(&self) -> Bounds<Pixels> {
         self.bounds
+    }
+
+    /// Name the window whose layout the area's shared split sizes follow.
+    ///
+    /// The splits' measured sizes live in one state per split, shared by every
+    /// window the area is drawn in. When two differently sized windows both
+    /// write their measurements into it, each makes the other's layout stale
+    /// and they redraw each other forever. A host that draws one area in
+    /// several windows names the one that measures; the others draw the
+    /// splits at the sizes it measured. `None`, the default, measures in
+    /// every window, which is right for an area drawn in only one.
+    ///
+    /// Takes effect at the next draw of each window and schedules nothing,
+    /// so a host may call it while rendering.
+    pub fn set_measurement_window(&mut self, window: Option<WindowId>) {
+        self.measurement_window = window;
+    }
+
+    /// The window named by [`Self::set_measurement_window`].
+    pub fn measurement_window(&self) -> Option<WindowId> {
+        self.measurement_window
+    }
+
+    fn measures_in(&self, window: WindowId) -> bool {
+        self.measurement_window.is_none_or(|owner| owner == window)
+    }
+
+    fn record_bounds(&mut self, window: WindowId, bounds: Bounds<Pixels>, cx: &App) {
+        if self.measures_in(window) {
+            self.bounds = bounds;
+        }
+        if self.window_bounds.insert(window, bounds).is_none() {
+            // A window is new here: forget any that have since closed.
+            let live: HashSet<WindowId> = cx.windows().iter().map(|w| w.window_id()).collect();
+            self.window_bounds.retain(|id, _| live.contains(id));
+        }
     }
 
     /// The tree for one region, or `None` for a dock that does not exist.
@@ -1484,6 +1531,7 @@ impl DockArea {
         &mut self,
         placement: DockPlacement,
         pointer: Point<Pixels>,
+        window: WindowId,
         cx: &mut Context<Self>,
     ) {
         let opposite = match placement {
@@ -1491,8 +1539,15 @@ impl DockArea {
             DockPlacement::Right => self.dock_size(DockPlacement::Left),
             _ => None,
         };
+        // The pointer is in `window`'s coordinates, so it is measured against
+        // the area as that window laid it out.
+        let area_bounds = self
+            .window_bounds
+            .get(&window)
+            .copied()
+            .unwrap_or(self.bounds);
         let sizing = DockSizing::new(placement)
-            .with_area_bounds(self.bounds)
+            .with_area_bounds(area_bounds)
             .with_opposite_dock_size(opposite.unwrap_or(px(0.)));
         let size = sizing.clamp(sizing.size_from_pointer(pointer));
 
@@ -1561,6 +1616,7 @@ impl DockArea {
                     .when_some(self.splits.get(&node.id()), |group, cached| {
                         group.with_state(&cached.entity)
                     })
+                    .measure(self.measures_in(window.window_handle().window_id()))
                     .with_handle_appearance({
                         let renderer = self.renderer.clone();
                         Rc::new(move |handle, window, cx| {
@@ -1652,8 +1708,11 @@ impl DockArea {
                     _ = area.update(cx, |area, cx| area.toggle_dock(placement, window, cx));
                 })
             },
-            on_resize: Rc::new(move |pointer, _, cx| {
-                _ = area.update(cx, |area, cx| area.resize_dock(placement, pointer, cx));
+            on_resize: Rc::new(move |pointer, window, cx| {
+                let window = window.window_handle().window_id();
+                _ = area.update(cx, |area, cx| {
+                    area.resize_dock(placement, pointer, window, cx)
+                });
             }),
         }
     }
@@ -1686,8 +1745,9 @@ impl Render for DockArea {
             .overflow_hidden()
             .flex()
             .flex_row()
-            .on_prepaint(move |bounds, _, cx| {
-                area.update(cx, |area, _| area.bounds = bounds);
+            .on_prepaint(move |bounds, window, cx| {
+                let window = window.window_handle().window_id();
+                area.update(cx, |area, cx| area.record_bounds(window, bounds, cx));
             })
             .track_focus(&self.focus_handle)
             .map(|frame| match self.zoomed_view() {
