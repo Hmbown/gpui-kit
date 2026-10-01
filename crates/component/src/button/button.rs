@@ -574,6 +574,13 @@ impl RenderOnce for Button {
         let mut base = self.base;
         let children = self.children;
         let instance_style = base.style().clone();
+        // The content row fills the root, so alignment set on the button only
+        // reaches what it shows when the row repeats it.
+        let content_alignment = StyleRefinement {
+            justify_content: instance_style.justify_content,
+            align_items: instance_style.align_items,
+            ..Default::default()
+        };
         let normal_style = style.normal(self.outline, cx);
         let selected_style = style.selected(self.outline, cx);
         let disabled_style = style.disabled(self.outline, cx);
@@ -710,6 +717,7 @@ impl RenderOnce for Button {
                 _ => this.gap_2(),
             })
             .refine_style(&self.content_style)
+            .refine_style(&content_alignment)
             .when_some(self.icon, |this, icon| {
                 this.child(
                     icon.loading_icon(self.loading_icon)
@@ -1729,6 +1737,75 @@ mod tests {
             .expect("application content must prepaint through the Base child seam");
         assert!(bounds.size.width > px(0.));
         assert!(bounds.size.height > px(0.));
+    }
+
+    /// A row-shaped button — full width, content on the left — is built by
+    /// asking the button for `justify_start`. The content row fills the root,
+    /// so the request has to reach that row, or every such row is centered.
+    #[gpui::test]
+    fn full_width_button_places_content_by_its_alignment(cx: &mut gpui::TestAppContext) {
+        use gpui::{Context, Render};
+
+        struct AlignmentHarness;
+
+        fn row(id: &'static str) -> Button {
+            Button::new(id).ghost().w_full().child(
+                div()
+                    .debug_selector(move || format!("{id}-content"))
+                    .child("Row"),
+            )
+        }
+
+        impl Render for AlignmentHarness {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(400.))
+                    .child(
+                        row("start")
+                            .justify_start()
+                            .debug_selector(|| "start".into()),
+                    )
+                    .child(row("centered").debug_selector(|| "centered".into()))
+                    .child(
+                        row("top")
+                            .h(px(60.))
+                            .items_start()
+                            .debug_selector(|| "top".into()),
+                    )
+            }
+        }
+
+        cx.update(crate::init);
+        let (_, cx) = cx.add_window_view(|_, _| AlignmentHarness);
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let mut bounds = |selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} must be laid out"))
+        };
+
+        let (start, start_content) = (bounds("start"), bounds("start-content"));
+        assert_eq!(start.size.width, px(400.));
+        assert!(
+            start_content.left() - start.left() < px(16.),
+            "justify_start must put the content at the button's leading padding, \
+             got {start_content:?} in {start:?}"
+        );
+
+        let (centered, centered_content) = (bounds("centered"), bounds("centered-content"));
+        let leading = centered_content.left() - centered.left();
+        let trailing = centered.right() - centered_content.right();
+        assert!(
+            leading > px(100.) && (leading - trailing).abs() < px(1.),
+            "a button asked for nothing keeps its content centered, \
+             got {centered_content:?} in {centered:?}"
+        );
+
+        let (top, top_content) = (bounds("top"), bounds("top-content"));
+        assert_eq!(
+            top_content.top(),
+            top.top(),
+            "items_start must put the content at the button's top edge"
+        );
     }
 
     #[gpui::test]
