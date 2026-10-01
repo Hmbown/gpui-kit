@@ -363,6 +363,28 @@ Button::new("btn")
     )
 ```
 
+### Content Alignment
+
+A button centers its content. Alignment set on the button places the content
+instead, so a full-width row keeps its label and children on the leading edge:
+
+```rust
+Button::new("row")
+    .ghost()
+    .w_full()
+    .h_auto()
+    .justify_start()
+    .child(
+        v_flex()
+            .items_start()
+            .child("Pull requests")
+            .child("GitHub"),
+    )
+```
+
+`items_start()` and `items_end()` likewise place the content vertically in a
+button taller than it.
+
 [Button]: https://docs.rs/gpui-component/latest/gpui_component/button/struct.Button.html
 [ButtonGroup]: https://docs.rs/gpui-component/latest/gpui_component/button/struct.ButtonGroup.html
 [ButtonCustomVariant]: https://docs.rs/gpui-component/latest/gpui_component/button/struct.ButtonCustomVariant.html
