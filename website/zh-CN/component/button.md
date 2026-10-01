@@ -323,6 +323,26 @@ Button::new("btn")
     )
 ```
 
+### 内容对齐
+
+按钮默认将内容居中。在按钮上设置的对齐方式会作用于内容本身，因此整行宽度的按钮也能让标签和子内容靠起始边排列：
+
+```rust
+Button::new("row")
+    .ghost()
+    .w_full()
+    .h_auto()
+    .justify_start()
+    .child(
+        v_flex()
+            .items_start()
+            .child("Pull requests")
+            .child("GitHub"),
+    )
+```
+
+同样，当按钮比内容高时，`items_start()` 和 `items_end()` 决定内容在垂直方向上的位置。
+
 [Button]: https://docs.rs/gpui-component/latest/gpui_component/button/struct.Button.html
 [ButtonGroup]: https://docs.rs/gpui-component/latest/gpui_component/button/struct.ButtonGroup.html
 [ButtonCustomVariant]: https://docs.rs/gpui-component/latest/gpui_component/button/struct.ButtonCustomVariant.html
